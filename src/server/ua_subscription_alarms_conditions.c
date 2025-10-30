@@ -243,32 +243,55 @@ UA_Server_setConditionTwoStateVariableCallback(UA_Server *server, const UA_NodeI
 static UA_StatusCode
 getConditionTwoStateVariableCallback(UA_Server *server, const UA_NodeId *branch,
                                     UA_Condition *condition, UA_Boolean *removeBranch,
-                                    UA_TwoStateVariableCallbackType callbackType) {
+                                    UA_TwoStateVariableCallbackType callbackType,
+                                    const UA_NodeId *sessionId) {
+    UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_USERLAND,
+                "A&C trace: getConditionTwoStateVariableCallback(type=%u)",
+                (unsigned)callbackType);
+    /* Log sessionId for diagnostic purposes */
+    const UA_NodeId *sidArg = sessionId;
+    if(sessionId) {
+#ifdef UA_ENABLE_TYPEDESCRIPTION
+        UA_String sidStr = UA_STRING_NULL;
+        if(UA_print(sessionId, &UA_TYPES[UA_TYPES_NODEID], &sidStr) == UA_STATUSCODE_GOOD) {
+            UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_USERLAND,
+                        "A&C callback sessionId=%.*s", (int)sidStr.length, sidStr.data);
+        }
+        UA_String_clear(&sidStr);
+        /* Validate the session id can resolve to an active session */
+        UA_Session *sidChk = UA_Server_getSessionById(server, sessionId);
+        if(!sidChk)
+            sidArg = NULL;
+        UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_USERLAND,
+                    "A&C callback sessionId resolved: %s",
+                    (sidChk != NULL) ? "yes" : "no");
+#endif
+    }
     switch(callbackType) {
     case UA_ENTERING_ENABLEDSTATE:
         if(condition->callbacks.enableStateCallback != NULL)
-            return condition->callbacks.enableStateCallback(server, branch);
+            return condition->callbacks.enableStateCallback(server, branch, sidArg);
         return UA_STATUSCODE_GOOD;//TODO log warning when the callback wasn't set
 
     case UA_ENTERING_ACKEDSTATE:
         if(condition->callbacks.ackStateCallback != NULL) {
             *removeBranch = condition->callbacks.ackedRemoveBranch;
-            return condition->callbacks.ackStateCallback(server, branch);
+            return condition->callbacks.ackStateCallback(server, branch, sidArg);
         }
         return UA_STATUSCODE_GOOD;
 
     case UA_ENTERING_CONFIRMEDSTATE:
         if(condition->callbacks.confirmStateCallback != NULL) {
             *removeBranch = condition->callbacks.confirmedRemoveBranch;
-            return condition->callbacks.confirmStateCallback(server, branch);
+            return condition->callbacks.confirmStateCallback(server, branch, sidArg);
         }
         return UA_STATUSCODE_GOOD;
 
     case UA_ENTERING_ACTIVESTATE:
         if(condition->callbacks.activeStateCallback != NULL)
-            return condition->callbacks.activeStateCallback(server, branch);
+            return condition->callbacks.activeStateCallback(server, branch, sidArg);
         return UA_STATUSCODE_GOOD;
-
+    
     default:
         return UA_STATUSCODE_BADNOTFOUND;
     }
@@ -277,7 +300,8 @@ getConditionTwoStateVariableCallback(UA_Server *server, const UA_NodeId *branch,
 static UA_StatusCode
 callConditionTwoStateVariableCallback(UA_Server *server, const UA_NodeId *condition,
                                       const UA_NodeId *conditionSource, UA_Boolean *removeBranch,
-                                      UA_TwoStateVariableCallbackType callbackType) {
+                                      UA_TwoStateVariableCallbackType callbackType,
+                                      const UA_NodeId *sessionId) {
     UA_ConditionSource *source = getConditionSource(server, conditionSource);
     if(!source)
         return UA_STATUSCODE_BADNOTFOUND;
@@ -286,14 +310,14 @@ callConditionTwoStateVariableCallback(UA_Server *server, const UA_NodeId *condit
     LIST_FOREACH(cond, &source->conditions, listEntry) {
         if(UA_NodeId_equal(&cond->conditionId, condition)) {
             return getConditionTwoStateVariableCallback(server, condition, cond,
-                                                        removeBranch, callbackType);
+                                                        removeBranch, callbackType, sessionId);
         }
         UA_ConditionBranch *branch;
         LIST_FOREACH(branch, &cond->conditionBranches, listEntry) {
             if(!UA_NodeId_equal(&branch->conditionBranchId, condition))
                 continue;
             return getConditionTwoStateVariableCallback(server, &branch->conditionBranchId,
-                                                        cond, removeBranch, callbackType);
+                                                        cond, removeBranch, callbackType, sessionId);
         }
     }
     return UA_STATUSCODE_BADNOTFOUND;
@@ -684,7 +708,8 @@ enteringDisabledState(UA_Server *server, const UA_NodeId *conditionId,
 static UA_StatusCode
 enteringEnabledState(UA_Server *server,
                      const UA_NodeId *conditionId,
-                     const UA_NodeId *conditionSource) {
+                     const UA_NodeId *conditionSource,
+                     const UA_NodeId *sessionId) {
     /* Get Condition */
     UA_Condition *cond = getCondition(server, conditionSource, conditionId);
     if(!cond) {
@@ -719,7 +744,7 @@ enteringEnabledState(UA_Server *server,
         UA_Boolean removeBranch = false;//not used
         retval = callConditionTwoStateVariableCallback(server, &triggeredNode,
                                                        conditionSource, &removeBranch,
-                                                       UA_ENTERING_ENABLEDSTATE);
+                                                       UA_ENTERING_ENABLEDSTATE, sessionId);
         CONDITION_ASSERT_RETURN_RETVAL(retval, "calling condition callback failed",);
         
         /* Trigger event */
@@ -770,7 +795,7 @@ afterWriteCallbackEnabledStateChange(UA_Server *server,
                                      UA_NodeId_clear(&conditionSource););
     } else {
         /* Enable all branches and update list */
-        retval = enteringEnabledState(server, &conditionNode, &conditionSource);
+        retval = enteringEnabledState(server, &conditionNode, &conditionSource, sessionId);
         UA_NodeId_clear(&conditionNode);
         CONDITION_ASSERT_RETURN_VOID(retval, "Entering enabled state failed",
                                      UA_NodeId_clear(&conditionSource););
@@ -783,7 +808,12 @@ static void
 afterWriteCallbackAckedStateChange(UA_Server *server,
                                    const UA_NodeId *sessionId, void *sessionContext,
                                    const UA_NodeId *nodeId, void *nodeContext,
-                                   const UA_NumericRange *range, const UA_DataValue *data) {
+                                   const UA_NumericRange *range, const UA_DataValue *data){
+    // Note that this is called also when ack value turns false, which makes no sense overall, so this is treated separately
+    UA_Boolean ackValue = *((UA_Boolean *)data->value.data);
+    UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_USERLAND,
+                "A&C trace: afterWriteCallbackAckedStateChange write-path entered (value=%s)",
+                ackValue ? "true" : "false");
     /* Get the AckedState NodeId then The Condition NodeId */
     UA_NodeId twoStateVariableNode;
     UA_StatusCode retval = getFieldParentNodeId(server, nodeId, &twoStateVariableNode);
@@ -797,7 +827,7 @@ afterWriteCallbackAckedStateChange(UA_Server *server,
     /* Callback for change to true in AckedState/Id property.
      * First check whether the value is true (ackedState/Id == true).
      * That check makes it possible to set ackedState/Id to false, without triggering an event */
-    if(*((UA_Boolean *)data->value.data) == false) {
+    if(ackValue == false) {
         /* Set unacknowledging time */
         retval = UA_Server_writeObjectProperty_scalar(server, conditionNode, fieldTimeQN,
                                                       &data->sourceTimestamp,
@@ -815,6 +845,41 @@ afterWriteCallbackAckedStateChange(UA_Server *server,
         return;
     }
 
+    /* Ask user first if ack is allowed (only if ackValue is true) */
+    UA_NodeId conditionSource;
+    retval = getNodeIdValueOfConditionField(server, &conditionNode, fieldSourceQN,
+                                            &conditionSource);
+    CONDITION_ASSERT_RETURN_VOID(retval, "ConditionSource not found",
+                                 UA_NodeId_clear(&conditionNode););
+
+    // Skip it since user callback has already been called by acknowledgeMethodCallback, we don't
+    // need this so late
+
+    // /* If the write originates from the Acknowledge method, skip user callback here
+    //  * to avoid a duplicate invocation. The method path already performed it. */
+    // UA_Boolean methodOrigin = false;
+    // (void)isConditionOrBranch(server, &conditionNode, &conditionSource, &methodOrigin);
+    // UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_USERLAND,
+    //             "A&C trace: ack write origin %s",
+    //             methodOrigin ? "method" : "non-method");
+    // if(!methodOrigin) {
+    //     UA_Boolean removeBranch = false;
+    //     retval = callConditionTwoStateVariableCallback(server, &conditionNode, &conditionSource,
+    //                                                    &removeBranch, UA_ENTERING_ACKEDSTATE, sessionId);
+    //     if(retval != UA_STATUSCODE_GOOD) {
+    //         /* Revert AckedState/Id to false */
+    //         UA_Boolean idValue = false;
+    //         UA_Variant value;
+    //         UA_Variant_setScalar(&value, &idValue, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    //         (void)UA_Server_setConditionVariableFieldProperty(server, conditionNode,
+    //                                                           &value, fieldAckedStateQN,
+    //                                                           twoStateVariableIdQN);
+    //         UA_NodeId_clear(&conditionNode);
+    //         UA_NodeId_clear(&conditionSource);
+    //         return;
+    //     }
+    // }
+
     /* Check if enabled and retained */
     if(!isTwoStateVariableInTrueState(server, &conditionNode, &fieldEnabledStateQN) ||
        !isRetained(server, &conditionNode)) {
@@ -826,6 +891,7 @@ afterWriteCallbackAckedStateChange(UA_Server *server,
                                                              &value, fieldAckedStateQN,
                                                              twoStateVariableIdQN);
         UA_NodeId_clear(&conditionNode);
+        UA_NodeId_clear(&conditionSource);
         CONDITION_ASSERT_RETURN_VOID(retval, "Set AckedState/Id failed",);
         return;
     }
@@ -845,20 +911,7 @@ afterWriteCallbackAckedStateChange(UA_Server *server,
     CONDITION_ASSERT_RETURN_VOID(retval, "Set Condition AckedState failed",
                                  UA_NodeId_clear(&conditionNode););
     
-    /* Get conditionSource */
-    UA_NodeId conditionSource;
-    retval = getNodeIdValueOfConditionField(server, &conditionNode, fieldSourceQN,
-                                            &conditionSource);
-    CONDITION_ASSERT_RETURN_VOID(retval, "ConditionSource not found",
-                                 UA_NodeId_clear(&conditionNode););
-    
-    /* User callback*/
-    UA_Boolean removeBranch = false;
-    retval = callConditionTwoStateVariableCallback(server, &conditionNode, &conditionSource,
-                                                   &removeBranch, UA_ENTERING_ACKEDSTATE);
-    CONDITION_ASSERT_RETURN_VOID(retval, "Calling condition callback failed",
-                                 UA_NodeId_clear(&conditionNode);
-                                 UA_NodeId_clear(&conditionSource););
+    /* conditionSource already available; user callback done above */
     
     /* Trigger event */
     //Condition Nodes should not be deleted after triggering the event
@@ -875,6 +928,15 @@ afterWriteCallbackConfirmedStateChange(UA_Server *server,
                                        const UA_NodeId *sessionId, void *sessionContext,
                                        const UA_NodeId *nodeId, void *nodeContext,
                                        const UA_NumericRange *range, const UA_DataValue *data) {
+    
+    // Note that this is called also when conf value turns false, which makes no sense
+    // overall, so this is treated separately
+    UA_Boolean confValue = *((UA_Boolean *)data->value.data);
+    UA_LOG_INFO(
+        &server->config.logger, UA_LOGCATEGORY_USERLAND,
+        "A&C trace: afterWriteCallbackConfirmedStateChange write-path entered (value=%s)",
+        confValue ? "true" : "false");
+
     UA_Variant value;
     UA_NodeId twoStateVariableNode;
     UA_StatusCode retval = getFieldParentNodeId(server, nodeId, &twoStateVariableNode);
@@ -888,7 +950,7 @@ afterWriteCallbackConfirmedStateChange(UA_Server *server,
     /* Callback to change to true in ConfirmedState/Id property.
      * First check whether the value is true (ConfirmedState/Id == true).
      * That check makes it possible to set ConfirmedState/Id to false, without triggering an event */
-    if(*((UA_Boolean *)data->value.data) == false) {
+    if(confValue == false) {
         /* Set unconfirming time */
         retval = UA_Server_writeObjectProperty_scalar(server, conditionNode, fieldTimeQN,
                                                       &data->sourceTimestamp,
@@ -945,15 +1007,22 @@ afterWriteCallbackConfirmedStateChange(UA_Server *server,
     retval = getNodeIdValueOfConditionField(server, &conditionNode, fieldSourceQN, &conditionSource);
     CONDITION_ASSERT_RETURN_VOID(retval, "ConditionSource not found",
                                  UA_NodeId_clear(&conditionNode););
-    
-    /* User callback*/
-    UA_Boolean removeBranch = false;
-    retval = callConditionTwoStateVariableCallback(server, &conditionNode,
-                                                   &conditionSource, &removeBranch,
-                                                   UA_ENTERING_CONFIRMEDSTATE);
-    CONDITION_ASSERT_RETURN_VOID(retval, "Calling condition callback failed",
-                                 UA_NodeId_clear(&conditionNode);
-                                 UA_NodeId_clear(&conditionSource););
+
+    // Skip it as we already called it from confirmMethodCallback and here 
+    // would be too late to stop confirmations
+
+    // /* If confirm originates from method, skip duplicate user callback here */
+    // UA_Boolean methodOrigin = false;
+    // (void)isConditionOrBranch(server, &conditionNode, &conditionSource, &methodOrigin);
+    // if(!methodOrigin) {
+    //     UA_Boolean removeBranch = false;
+    //     retval = callConditionTwoStateVariableCallback(server, &conditionNode,
+    //                                                    &conditionSource, &removeBranch,
+    //                                                    UA_ENTERING_CONFIRMEDSTATE, sessionId);
+    //     CONDITION_ASSERT_RETURN_VOID(retval, "Calling condition callback failed",
+    //                                  UA_NodeId_clear(&conditionNode);
+    //                                  UA_NodeId_clear(&conditionSource););
+    // }
     
     /* Trigger event */
     //Condition Nodes should not be deleted after triggering the event
@@ -1045,7 +1114,7 @@ afterWriteCallbackActiveStateChange(UA_Server *server,
             /* User callback*/
             UA_Boolean removeBranch = false;//not used
             retval = callConditionTwoStateVariableCallback(server, &conditionNode, &conditionSource,
-                                                           &removeBranch, UA_ENTERING_ACTIVESTATE);
+                                                        &removeBranch, UA_ENTERING_ACTIVESTATE, sessionId);
             CONDITION_ASSERT_RETURN_VOID(retval, "Calling condition callback failed",
                                          UA_NodeId_clear(&conditionNode);
                                          UA_NodeId_clear(&conditionSource););
@@ -1343,6 +1412,8 @@ acknowledgeMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
                           void *objectContext, size_t inputSize,
                           const UA_Variant *input, size_t outputSize,
                           UA_Variant *output) {
+    UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_USERLAND,
+                "A&C trace: acknowledgeMethodCallback method-path entered");
     UA_QualifiedName fieldComment = UA_QUALIFIEDNAME(0, CONDITION_FIELD_COMMENT);
     UA_Variant value;
 
@@ -1390,6 +1461,21 @@ acknowledgeMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
     
     UA_NodeId_clear(&eventType);
     
+    /* Ask user first if ack is allowed (use sessionId from method call) */
+    UA_NodeId conditionSource;
+    retval = getNodeIdValueOfConditionField(server, &conditionNode, fieldSourceQN, &conditionSource);
+    CONDITION_ASSERT_RETURN_RETVAL(retval, "ConditionSource not found",
+                                   UA_NodeId_clear(&conditionNode););
+
+    UA_Boolean removeBranch = false;
+    retval = callConditionTwoStateVariableCallback(server, &conditionNode, &conditionSource,
+                                                   &removeBranch, UA_ENTERING_ACKEDSTATE, sessionId);
+    if(retval != UA_STATUSCODE_GOOD) {
+        UA_NodeId_clear(&conditionNode);
+        UA_NodeId_clear(&conditionSource);
+        return retval;
+    }
+
     /* Set Comment. Check whether comment is empty -> leave the last value as is*/
     UA_LocalizedText *inputComment = (UA_LocalizedText *)input[1].data;
     UA_String nullString = UA_STRING_NULL;
@@ -1398,15 +1484,23 @@ acknowledgeMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
         UA_Variant_setScalar(&value, inputComment, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
         retval = UA_Server_setConditionField(server, conditionNode, &value, fieldComment);
         CONDITION_ASSERT_RETURN_RETVAL(retval, "Set Condition Comment failed",
-                                       UA_NodeId_clear(&conditionNode););
+                                       UA_NodeId_clear(&conditionNode);
+                                       UA_NodeId_clear(&conditionSource););
     }
 
     /* Set AcknowledgeableStateId */
+    /* Mark that this change originates from Acknowledge method (avoid double-callback) */
+    setIsCallerAC(server, &conditionNode, &conditionSource, true);
+
     UA_Boolean idValue = true;
     UA_Variant_setScalar(&value, &idValue, &UA_TYPES[UA_TYPES_BOOLEAN]);
     retval = UA_Server_setConditionVariableFieldProperty(server, conditionNode, &value,
                                                          fieldAckedStateQN, twoStateVariableIdQN);
+    /* Reset the marker after write */
+    setIsCallerAC(server, &conditionNode, &conditionSource, false);
+
     UA_NodeId_clear(&conditionNode);
+    UA_NodeId_clear(&conditionSource);
     CONDITION_ASSERT_RETURN_RETVAL(retval, "Acknowledge Condition failed",);
     return retval;
 }
@@ -1419,6 +1513,8 @@ confirmMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
                       void *objectContext, size_t inputSize,
                       const UA_Variant *input, size_t outputSize,
                       UA_Variant *output) {
+    UA_LOG_INFO(&server->config.logger, UA_LOGCATEGORY_USERLAND,
+                "A&C trace: confirmMethodCallback method-path entered");
     UA_QualifiedName fieldComment = UA_QUALIFIEDNAME(0, CONDITION_FIELD_COMMENT);
     UA_Variant value;
 
@@ -1465,7 +1561,22 @@ confirmMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
     }
     
     UA_NodeId_clear(&eventType);
-    
+
+    /* Ask user first if confirm is allowed */
+    UA_NodeId conditionSource;
+    retval = getNodeIdValueOfConditionField(server, &conditionNode, fieldSourceQN,
+                                            &conditionSource);
+    CONDITION_ASSERT_RETURN_RETVAL(retval, "ConditionSource not found",
+                                   UA_NodeId_clear(&conditionNode););
+
+   
+    UA_Boolean removeBranch = false;
+    retval = callConditionTwoStateVariableCallback(server, &conditionNode, &conditionSource,
+                                                   &removeBranch, UA_ENTERING_CONFIRMEDSTATE, sessionId);
+    CONDITION_ASSERT_RETURN_RETVAL(retval, "Confirm not allowed by user callback",
+                                   UA_NodeId_clear(&conditionNode);
+                                   UA_NodeId_clear(&conditionSource););
+
     /* Set Comment. Check whether comment is empty -> leave the last value as is*/
     UA_LocalizedText *inputComment = (UA_LocalizedText *)input[1].data;
     UA_String nullString = UA_STRING_NULL;
@@ -1474,17 +1585,25 @@ confirmMethodCallback(UA_Server *server, const UA_NodeId *sessionId,
         UA_Variant_setScalar(&value, inputComment, &UA_TYPES[UA_TYPES_LOCALIZEDTEXT]);
         retval = UA_Server_setConditionField(server, conditionNode, &value, fieldComment);
         CONDITION_ASSERT_RETURN_RETVAL(retval, "Set Condition Comment failed",
-                                       UA_NodeId_clear(&conditionNode););
+                                       UA_NodeId_clear(&conditionNode);
+                                       UA_NodeId_clear(&conditionSource););
     }
-    
+
+    /* Mark origin to avoid duplicate callback in write-path */
+    setIsCallerAC(server, &conditionNode, &conditionSource, true);
+
     /* Set ConfirmedStateId */
     UA_Boolean idValue = true;
     UA_Variant_setScalar(&value, &idValue, &UA_TYPES[UA_TYPES_BOOLEAN]);
     retval = UA_Server_setConditionVariableFieldProperty(server, conditionNode, &value,
                                                          fieldConfirmedStateQN,
                                                          twoStateVariableIdQN);
+    /* Reset marker */
+    setIsCallerAC(server, &conditionNode, &conditionSource, false);
+
     UA_NodeId_clear(&conditionNode);
-    CONDITION_ASSERT_RETURN_RETVAL(retval, "Acknowledge Condition failed",);
+    UA_NodeId_clear(&conditionSource);
+    CONDITION_ASSERT_RETURN_RETVAL(retval, "Confirm Condition failed",);
     return retval;
 }
 #endif//CONDITIONOPTIONALFIELDS_SUPPORT

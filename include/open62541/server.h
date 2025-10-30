@@ -1515,9 +1515,11 @@ typedef enum UA_TwoStateVariableCallbackType {
   UA_ENTERING_ACTIVESTATE
 } UA_TwoStateVariableCallbackType;
 
-/* Callback prototype to set user specific callbacks */
+/* Callback prototype to set user specific callbacks (extended with sessionId) */
 typedef UA_StatusCode
-(*UA_TwoStateVariableChangeCallback)(UA_Server *server, const UA_NodeId *condition);
+(*UA_TwoStateVariableChangeCallback)(UA_Server *server,
+                                     const UA_NodeId *condition,
+                                     const UA_NodeId *sessionId);
 
 /* Create condition instance. The function checks first whether the passed
  * conditionType is a subType of ConditionType. Then checks whether the
